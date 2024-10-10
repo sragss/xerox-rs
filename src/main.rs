@@ -110,15 +110,21 @@ fn move_file(entry: &DirEntry, target_root: &Path, source_root: &Path) -> io::Re
 
     info!("Moving file from {:?} to {:?}", source_path, target_path);
 
-    // Move the file
-    match copy(source_path, target_path) {
-        Ok(_) => {
-            info!("Successfully moved file: {:?}", entry.file_name());
-            Ok(())
-        }
-        Err(e) => {
-            error!("Failed to move file {:?}: {:?}", entry.file_name(), e);
-            Err(e)
+    // Check if the target file already exists
+    if target_path.exists() {
+        warn!("{:?} exists", entry.file_name());
+        Ok(())
+    } else {
+        // Move the file
+        match copy(source_path, target_path) {
+            Ok(_) => {
+                info!("Successfully moved file: {:?}", entry.file_name());
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to move file {:?}: {:?}", entry.file_name(), e);
+                Err(e)
+            }
         }
     }
 }
