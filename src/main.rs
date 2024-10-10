@@ -1,14 +1,15 @@
 use std::fs::{self, DirEntry, File};
 use std::io::{self, Read, ErrorKind};
 use std::path::{Path, PathBuf};
-// use std::fs::rename;
 use std::fs::copy;
 use std::thread;
 use std::time::Duration;
-use indicatif::{ProgressBar, ProgressStyle};
+use std::sync::Arc;
+use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
 use tracing::{info, error, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 use clap::Parser;
+use rayon::prelude::*;
 
 /// Command-line arguments structure
 #[derive(Parser, Debug)]
@@ -41,7 +42,7 @@ fn create_target_directory_structure(source: &Path, target: &Path, source_root: 
 }
 
 // Function to fetch the file with retries to handle file locks during download
-fn fetch_file_with_progress(entry: &DirEntry) -> io::Result<()> {
+fn fetch_file_with_progress(entry: &DirEntry, multi_progress: Arc<MultiProgress>) -> io::Result<()> {
     let path = entry.path();
     let file_size = get_file_size(entry).unwrap_or(0);
 
@@ -50,7 +51,7 @@ fn fetch_file_with_progress(entry: &DirEntry) -> io::Result<()> {
         info!("Fetching stub file: {:?}", path);
 
         // Create a progress bar
-        let pb = ProgressBar::new(file_size);
+        let pb = multi_progress.add(ProgressBar::new(file_size));
         pb.set_style(ProgressStyle::default_bar()
             .template("{wide_bar} {bytes}/{total_bytes} ({eta})")
             .progress_chars("##-"));
@@ -128,32 +129,41 @@ fn visit_dirs(dir: &Path) -> io::Result<(Vec<DirEntry>, Vec<PathBuf>)> {
     let mut dirs = vec![];
 
     if dir.is_dir() {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() {
-                files.push(entry);
-            } else if path.is_dir() {
-                dirs.push(path.clone());
-                // Recursively visit subdirectories
-                let (sub_files, sub_dirs) = visit_dirs(&path)?;
-                files.extend(sub_files);
-                dirs.extend(sub_dirs);
-            }
+        let entries: Vec<_> = fs::read_dir(dir)?.collect::<Result<_, _>>()?;
+        
+        let (sub_files, sub_dirs): (Vec<_>, Vec<_>) = entries.into_par_iter()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.is_file() {
+                    Some((Some(entry), None))
+                } else if path.is_dir() {
+                    let (sub_files, sub_dirs) = visit_dirs(&path).ok()?;
+                    Some((None, Some((path, sub_files, sub_dirs))))
+                } else {
+                    None
+                }
+            })
+            .unzip();
+
+        files.extend(sub_files.into_iter().flatten());
+        for (dir, sub_files, sub_dirs) in sub_dirs.into_iter().flatten() {
+            dirs.push(dir);
+            files.extend(sub_files);
+            dirs.extend(sub_dirs);
         }
     } else {
         error!("{} is not a dir", dir.display());
     }
 
     // Remove duplicates
-    files.sort_by_key(|a| a.path());
+    files.par_sort_by_key(|a| a.path());
     files.dedup_by(|a, b| a.path() == b.path());
 
-    dirs.sort();
+    dirs.par_sort_unstable();
     dirs.dedup();
 
     // Sort files by size (largest first)
-    files.sort_by(|a, b| get_file_size(b).cmp(&get_file_size(a)));
+    files.par_sort_by(|a, b| get_file_size(b).cmp(&get_file_size(a)));
 
     Ok((files, dirs))
 }
@@ -184,27 +194,34 @@ fn main() -> io::Result<()> {
     };
 
     // Create all directories in the target location
-    for dir in dirs {
+    dirs.par_iter().try_for_each(|dir| {
         let target_dir = create_target_directory_structure(&dir, &one_drive_dir, &box_dir)?;
         info!("Created directory: {:?}", target_dir);
-    }
+        Ok::<(), io::Error>(())
+    })?;
+
+    // Create a MultiProgress instance
+    let multi_progress = Arc::new(MultiProgress::new());
 
     // Iterate through the files, sorted by size
-    for file in files {
-        // info!("FILE: {}", file.path().display());
-        // Fetch the file with progress (this will trigger download if it's a stub)
-        if let Err(e) = fetch_file_with_progress(&file) {
-            error!("Failed to fetch file: {:?}", e);
-            continue; // Move to the next file if there's an error
-        }
+    files.par_iter()
+        .map(|file| {
+            let multi_progress = Arc::clone(&multi_progress);
+            // Fetch the file with progress (this will trigger download if it's a stub)
+            if let Err(e) = fetch_file_with_progress(&file, multi_progress) {
+                error!("Failed to fetch file: {:?}", e);
+                return Err(e);
+            }
 
-        // Move the file to the one-drive directory, preserving folder structure
-        // info!("Processing file: {}", file.path().display());
-        if let Err(e) = move_file(&file, &one_drive_dir, &box_dir) {
-            error!("Failed to move file: {:?}", e);
-            continue; // Move to the next file if there's an error
-        }
-    }
+            // Move the file to the one-drive directory, preserving folder structure
+            if let Err(e) = move_file(&file, &one_drive_dir, &box_dir) {
+                error!("Failed to move file: {:?}", e);
+                return Err(e);
+            }
+
+            Ok(())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(())
 }
